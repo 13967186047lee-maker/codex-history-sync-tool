@@ -77,10 +77,6 @@ def replace_file_with_retry(source_path: Path, target_path: Path) -> None:
             return
         except PermissionError as exc:
             last_error = exc
-        except OSError as exc:
-            if getattr(exc, "winerror", None) not in (5, 32):
-                raise
-            last_error = exc
 
         if attempt < FILE_REPLACE_RETRY_LIMIT - 1:
             time.sleep(FILE_REPLACE_RETRY_DELAY_SECONDS)

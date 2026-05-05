@@ -1,8 +1,8 @@
 # Codex History Sync Tool
 
-一个用于恢复 Codex Desktop 本地历史对话显示的小工具。
+一个用于恢复 Codex Desktop 本地历史对话显示的小工具（macOS 版）。
 
-当你切换 API、provider、模型或登录方式之后，Codex Desktop 有时会出现“本地历史明明还在，但侧边栏看不到”的情况。这个工具会检查本机的本地历史数据库、会话文件和侧边栏索引，并把旧线程重新挂到当前正在使用的 `model_provider` / `model` 下面。
+当你切换 API、provider、模型或登录方式之后，Codex Desktop 有时会出现"本地历史明明还在，但侧边栏看不到"的情况。这个工具会检查本机的本地历史数据库、会话文件和侧边栏索引，并把旧线程重新挂到当前正在使用的 `model_provider` / `model` 下面。
 
 ## 这个工具能做什么
 
@@ -12,7 +12,7 @@
 - Codex Desktop 正在运行时也可以同步；如果本地数据库正在写入，工具会等待空闲后继续
 - 在同步前自动备份数据库、侧边栏索引和会话元数据
 - 从备份恢复数据库
-- 提供一个可直接点击的 Windows 图形界面
+- 提供一个可直接点击的 macOS 图形界面
 
 ## 适用场景
 
@@ -20,7 +20,7 @@
 - 你切换了不同 provider
 - 你切换了不同模型
 - 你切换了登录方式
-- 你确认本地历史文件还在，但 Codex Desktop 左侧历史列表变空了
+- 你确认本地历史文件还在，但 Codex Desktop ��侧历史列表变空了
 
 ## 不适用的场景
 
@@ -30,60 +30,61 @@
 
 ## 运行环境
 
-- Windows
-- PowerShell 5.1 或更高版本
-- 已安装 Python 3.10 或更高版本，并可通过 `py -3` 调用
-- 本机存在 Codex Desktop 本地数据目录，通常是 `%USERPROFILE%\\.codex`
+- macOS
+- Python 3.10 或更高版本（含 tkinter，可通过 `python3 --version` 确认）
+- 本机存在 Codex Desktop 本地数据目录，通常是 `~/.codex`
+
+> **提示**：macOS 系统自带的 Python 版本可能较旧。推荐通过 [python.org](https://www.python.org/downloads/) 或 Homebrew（`brew install python`）安装较新版本，两者均内置 tkinter。
 
 ## 快速使用
 
 ### 图形界面
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\launch_ui.ps1
+```bash
+python3 launch_ui.py
 ```
 
-### 创建桌面快捷方式
+或使用 Shell 脚本启动：
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\launch_ui.ps1 -InstallShortcutOnly
+```bash
+bash launch_ui.sh
 ```
 
 ### 查看当前状态
 
-```powershell
-py -3 .\sync_backend.py --json status
+```bash
+python3 sync_backend.py --json status
 ```
 
 ### 执行同步
 
-```powershell
-py -3 .\sync_backend.py --json sync
+```bash
+python3 sync_backend.py --json sync
 ```
 
 ### 手动创建备份
 
-```powershell
-py -3 .\sync_backend.py --json backup
+```bash
+python3 sync_backend.py --json backup
 ```
 
 ### 从最新备份恢复
 
-```powershell
-py -3 .\sync_backend.py --json restore
+```bash
+python3 sync_backend.py --json restore
 ```
 
 ### 运行测试
 
-```powershell
-py -3 -m unittest discover -s tests -v
+```bash
+python3 -m unittest discover -s tests -v
 ```
 
 ## 备份说明
 
 - 每次同步前都会自动创建一份备份
 - 每次恢复前也会先创建一份安全备份
-- 备份默认保存在 `%USERPROFILE%\\.codex\\history_sync_backups`
+- 备份默认保存在 `~/.codex/history_sync_backups`
 - 新版备份会同时保存 `session_index.jsonl` 和会话文件首行元数据，恢复时会一起还原
 
 ## 使用建议
@@ -96,7 +97,8 @@ py -3 -m unittest discover -s tests -v
 ## 项目文件
 
 - `sync_backend.py`：后端同步、备份、恢复逻辑
-- `launch_ui.ps1`：Windows 图形界面
+- `launch_ui.py`：macOS 图形界面（Python / tkinter）
+- `launch_ui.sh`：命令行快速启动脚本
 
 ## 免责声明
 
