@@ -6,27 +6,124 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox, ttk
 
 TOOL_ROOT = Path(__file__).parent
 BACKEND_PATH = TOOL_ROOT / "sync_backend.py"
+STREAM_EVENT_KEYS = {"event", "stage", "message", "done", "total", "elapsed_ms", "extra"}
 
 
 def invoke_backend(*args: str) -> dict:
     cmd = [sys.executable, str(BACKEND_PATH), "--json", *args]
     result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
-    text = (result.stdout + result.stderr).strip()
-    if not text:
+    stdout = result.stdout.strip()
+    stderr = result.stderr.strip()
+    if not stdout:
+        if stderr:
+            raise RuntimeError(stderr)
         raise RuntimeError("后端没有返回任何内容。")
     try:
-        data = json.loads(text)
+        data = json.loads(stdout)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"后端 JSON 解析失败。\n原始错误: {exc}\n返回内容:\n{text}") from exc
+        detail = stdout
+        if stderr:
+            detail = f"{detail}\n\nstderr:\n{stderr}"
+        raise RuntimeError(f"后端 JSON 解析失败。\n原始错误: {exc}\n返回内容:\n{detail}") from exc
     if result.returncode != 0 or not data.get("ok"):
-        raise RuntimeError(data.get("error") or f"后端执行失败。\n{text}")
+        error = data.get("error") or f"后端执行失败。\n{stdout}"
+        if stderr:
+            error = f"{error}\n\nstderr:\n{stderr}"
+        raise RuntimeError(error)
     return data
+
+
+def parse_backend_stream_line(line: str) -> tuple[dict | None, str | None]:
+    raw = line.strip()
+    if not raw:
+        return None, None
+    try:
+        event = json.loads(raw)
+    except json.JSONDecodeError:
+        return None, f"后端输出非 JSON 行: {raw}"
+    if not isinstance(event, dict):
+        return None, f"后端输出不是 JSON 对象: {raw}"
+    missing = sorted(STREAM_EVENT_KEYS - set(event))
+    if missing:
+        return None, f"后端进度事件缺少字段: {', '.join(missing)}"
+    return event, None
+
+
+def diagnostic_stream_event(message: str) -> dict:
+    return {
+        "event": "diagnostic",
+        "stage": "stream",
+        "message": message,
+        "done": None,
+        "total": None,
+        "elapsed_ms": 0,
+        "extra": {},
+    }
+
+
+def invoke_backend_stream(*args: str, on_event: Callable[[dict], None] | None = None) -> dict:
+    cmd = [sys.executable, str(BACKEND_PATH), "--jsonl", *args]
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+    )
+    result: dict | None = None
+    stream_error = ""
+    diagnostics: list[str] = []
+
+    if process.stdout is None:
+        raise RuntimeError("无法读取后端进度输出。")
+
+    for line in process.stdout:
+        event, diagnostic = parse_backend_stream_line(line)
+        if diagnostic:
+            diagnostics.append(diagnostic)
+            if on_event:
+                on_event(diagnostic_stream_event(diagnostic))
+            continue
+        if event is None:
+            continue
+        if on_event:
+            on_event(event)
+        event_type = str(event.get("event") or "")
+        if event_type == "result":
+            extra = event.get("extra")
+            if isinstance(extra, dict):
+                result = extra
+        elif event_type == "error":
+            extra = event.get("extra")
+            if isinstance(extra, dict):
+                stream_error = str(extra.get("error") or event.get("message") or "后端执行失败。")
+            else:
+                stream_error = str(event.get("message") or "后端执行失败。")
+
+    stderr = process.stderr.read().strip() if process.stderr is not None else ""
+    returncode = process.wait()
+    if stream_error:
+        if stderr:
+            stream_error = f"{stream_error}\n\nstderr:\n{stderr}"
+        raise RuntimeError(stream_error)
+    if returncode != 0:
+        detail = stderr or "\n".join(diagnostics) or "后端没有返回错误详情。"
+        raise RuntimeError(f"后端执行失败，退出码 {returncode}。\n{detail}")
+    if result is None:
+        detail = stderr or "\n".join(diagnostics)
+        if detail:
+            raise RuntimeError(f"后端没有返回最终结果。\n{detail}")
+        raise RuntimeError("后端没有返回最终结果。")
+    if not result.get("ok"):
+        raise RuntimeError(str(result.get("error") or "后端执行失败。"))
+    return result
 
 
 def format_counts(counts) -> str:
@@ -45,6 +142,34 @@ def format_duration(ms) -> str:
     if ms is None:
         return "0 秒"
     return f"{round(float(ms) / 1000, 1)} 秒"
+
+
+def format_stream_event_message(event: dict) -> str:
+    message = str(event.get("message") or "正在处理...")
+    done = event.get("done")
+    total = event.get("total")
+    elapsed_ms = event.get("elapsed_ms")
+    details = []
+    extra = event.get("extra")
+    if isinstance(done, int) and isinstance(total, int) and total > 0:
+        details.append(f"{done}/{total}")
+    if isinstance(extra, dict):
+        labeled_counts = [
+            ("updated", "已更新"),
+            ("updated_rows", "数据库更新"),
+            ("skipped", "已跳过"),
+            ("missing", "缺失"),
+            ("rewritten_entries", "索引条目"),
+        ]
+        for key, label in labeled_counts:
+            value = extra.get(key)
+            if isinstance(value, int):
+                details.append(f"{label} {value}")
+    if isinstance(elapsed_ms, int) and elapsed_ms > 0:
+        details.append(f"已用 {format_duration(elapsed_ms)}")
+    if details:
+        return f"{message}（{'，'.join(details)}）"
+    return message
 
 
 def get_friendly_status(status: dict) -> str:
@@ -95,7 +220,7 @@ class App(tk.Tk):
 
         intro_lbl = ttk.Label(
             main,
-            text="用于把"换了 API / Provider / 登录方式后看不见的本地历史"重新挂回当前 Codex。Codex 开着也可以试，工具会等待数据库空闲。",
+            text='用于把"换了 API / Provider / 登录方式后看不见的本地历史"重新挂回当前 Codex。Codex 开着也可以试，工具会等待数据库空闲。',
             wraplength=840,
             foreground="#4D5969",
         )
@@ -228,16 +353,29 @@ class App(tk.Tk):
             self.restore_latest_btn,
         ]
 
+    def _show_indeterminate_progress(self) -> None:
+        self.progress.stop()
+        self.progress.configure(mode="indeterminate", maximum=100, value=0)
+        self.progress.grid()
+        self.progress.start(10)
+
+    def _show_determinate_progress(self, done: int, total: int) -> None:
+        self.progress.stop()
+        safe_total = max(total, 1)
+        safe_done = min(max(done, 0), safe_total)
+        self.progress.configure(mode="determinate", maximum=safe_total, value=safe_done)
+        self.progress.grid()
+
     def _set_busy(self, busy: bool, message: str = "") -> None:
         state = "disabled" if busy else "normal"
         for btn in self._all_buttons():
             btn.configure(state=state)
         if busy:
             self.status_label.configure(text=message)
-            self.progress.grid()
-            self.progress.start(10)
+            self._show_indeterminate_progress()
         else:
             self.progress.stop()
+            self.progress.configure(mode="indeterminate", maximum=100, value=0)
             self.progress.grid_remove()
             if self._latest_state:
                 self.status_label.configure(text=get_friendly_status(self._latest_state))
@@ -250,6 +388,31 @@ class App(tk.Tk):
         self.log_text.insert("end", f"[{timestamp}] {message}\n")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
+
+    def _handle_stream_event(self, event: dict) -> None:
+        event_type = str(event.get("event") or "")
+        message = format_stream_event_message(event)
+        if event_type == "diagnostic":
+            self._append_log(message)
+            return
+        if event_type == "error":
+            self.status_label.configure(text=message)
+            self._append_log(f"后端错误: {message}")
+            return
+        if event_type != "progress":
+            return
+
+        self.status_label.configure(text=message)
+        done = event.get("done")
+        total = event.get("total")
+        if isinstance(done, int) and isinstance(total, int) and total > 0:
+            self._show_determinate_progress(done, total)
+        else:
+            self._show_indeterminate_progress()
+        self._append_log(message)
+
+    def _stream_event_to_ui(self, event: dict) -> None:
+        self.after(0, lambda event=event: self._handle_stream_event(event))
 
     def _apply_state(self, status: dict) -> None:
         self._latest_state = status
@@ -355,12 +518,13 @@ class App(tk.Tk):
 
         def run() -> None:
             try:
-                result = invoke_backend("sync")
+                result = invoke_backend_stream("sync", on_event=self._stream_event_to_ui)
 
                 def update() -> None:
                     self._append_log(
                         f"同步完成。数据库更新 {result.get('updated_rows', 0)} 条，"
-                        f"会话文件更新 {result.get('updated_session_files', 0)} 个。"
+                        f"会话文件更新 {result.get('updated_session_files', 0)} 个，"
+                        f"跳过 {result.get('skipped_session_files', 0)} 个。"
                     )
                     timing = result.get("timing") or {}
                     self._append_log(
@@ -400,13 +564,16 @@ class App(tk.Tk):
     def _on_backup(self) -> None:
         def run() -> None:
             try:
-                result = invoke_backend("backup")
+                result = invoke_backend_stream("backup", on_event=self._stream_event_to_ui)
+                self.after(0, lambda: self.status_label.configure(text="正在刷新备份列表..."))
+                status = invoke_backend("status")
 
                 def update() -> None:
                     self._append_log(f"手动备份完成: {result.get('backup_path')}")
                     timing = result.get("timing") or {}
                     self._append_log(f"备份耗时: {format_duration(timing.get('total_ms'))}")
-                    self._refresh_state()
+                    self._apply_state(status)
+                    self._append_log(f"状态已刷新：{get_friendly_status(status)}")
 
                 self.after(0, update)
             except Exception as exc:
@@ -459,7 +626,7 @@ class App(tk.Tk):
     def _run_restore(self, *args: str) -> None:
         def run() -> None:
             try:
-                result = invoke_backend(*args)
+                result = invoke_backend_stream(*args, on_event=self._stream_event_to_ui)
 
                 def update() -> None:
                     self._append_log(f"恢复完成。来源备份: {result.get('restored_from')}")

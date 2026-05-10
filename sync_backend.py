@@ -6,14 +6,21 @@ import re
 import sqlite3
 import time
 from collections import OrderedDict
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - exercised only on Python 3.10
+    tomllib = None
 
 SESSION_FILENAME_PATTERN = re.compile(
-    r"rollout-.*-(?P<id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$"
+    r"rollout-.*-(?P<id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$",
+    re.IGNORECASE,
 )
 UTC = timezone.utc
 DEFAULT_DB_TIMEOUT_SECONDS = 30.0
@@ -45,6 +52,9 @@ class SessionRecord:
     path: Path
     model_provider: str
     model: str | None
+
+
+ProgressCallback = Callable[[dict[str, object]], None]
 
 
 def resolve_paths(codex_home: str | None) -> Paths:
@@ -95,16 +105,38 @@ def write_text_exact(path: Path, text: str) -> None:
             temp_path.unlink()
 
 
+def parse_toml_string_value(config_text: str, key: str) -> str | None:
+    if tomllib is not None:
+        data = tomllib.loads(config_text)
+        value = data.get(key)
+        return value if isinstance(value, str) else None
+
+    match = re.search(rf"(?m)^\s*{re.escape(key)}\s*=\s*(['\"])(.*?)\1", config_text)
+    return match.group(2) if match else None
+
+
 def parse_current_provider(config_text: str) -> str:
-    match = re.search(r'(?m)^\s*model_provider\s*=\s*"([^"]+)"', config_text)
-    if not match:
+    value = parse_toml_string_value(config_text, "model_provider")
+    if value is None:
         raise RuntimeError("Could not find model_provider in config.toml.")
-    return match.group(1)
+    return value
 
 
 def parse_current_model(config_text: str) -> str | None:
-    match = re.search(r'(?m)^\s*model\s*=\s*"([^"]+)"', config_text)
-    return match.group(1) if match else None
+    return parse_toml_string_value(config_text, "model")
+
+
+def unique_backup_path(paths: Paths, label: str) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    base = paths.backup_dir / f"state_5.sqlite.{label}.{timestamp}.bak"
+    if not base.exists():
+        return base
+
+    for suffix in range(1, 1000):
+        candidate = paths.backup_dir / f"state_5.sqlite.{label}.{timestamp}.{suffix}.bak"
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError("Could not allocate a unique backup filename.")
 
 
 @contextmanager
@@ -141,6 +173,17 @@ def get_thread_columns(conn: sqlite3.Connection) -> set[str]:
     return {str(row["name"]) for row in conn.execute("PRAGMA table_info(threads)")}
 
 
+def ensure_thread_schema(conn: sqlite3.Connection) -> set[str]:
+    columns = get_thread_columns(conn)
+    missing = sorted({"id", "model_provider"} - columns)
+    if missing:
+        raise RuntimeError(
+            "Codex history database does not look like a supported schema; "
+            f"missing threads column(s): {', '.join(missing)}"
+        )
+    return columns
+
+
 def counts_to_rows(counts: OrderedDict[str, int]) -> list[dict[str, object]]:
     return [{"provider": key, "count": value} for key, value in counts.items()]
 
@@ -163,6 +206,61 @@ def ordered_counts(values: list[str]) -> OrderedDict[str, int]:
 
 def elapsed_ms(started_at: float) -> int:
     return int((time.monotonic() - started_at) * 1000)
+
+
+def build_progress_event(
+    event: str,
+    stage: str,
+    message: str,
+    *,
+    started_at: float | None = None,
+    done: int | None = None,
+    total: int | None = None,
+    extra: dict[str, object] | None = None,
+) -> dict[str, object]:
+    return {
+        "event": event,
+        "stage": stage,
+        "message": message,
+        "done": done,
+        "total": total,
+        "elapsed_ms": elapsed_ms(started_at) if started_at is not None else 0,
+        "extra": extra or {},
+    }
+
+
+def emit_progress(
+    progress: ProgressCallback | None,
+    event: str,
+    stage: str,
+    message: str,
+    *,
+    started_at: float | None = None,
+    done: int | None = None,
+    total: int | None = None,
+    extra: dict[str, object] | None = None,
+) -> None:
+    if progress is None:
+        return
+    progress(
+        build_progress_event(
+            event,
+            stage,
+            message,
+            started_at=started_at,
+            done=done,
+            total=total,
+            extra=extra,
+        )
+    )
+
+
+def should_emit_count_progress(done: int, total: int) -> bool:
+    if total <= 0:
+        return done <= 1
+    if done == total or done <= 3:
+        return True
+    return done % 50 == 0
 
 
 def query_provider_counts(conn: sqlite3.Connection) -> OrderedDict[str, int]:
@@ -298,13 +396,21 @@ def parse_session_record(path: Path) -> SessionRecord | None:
     if not SESSION_FILENAME_PATTERN.search(path.name):
         return None
 
-    with path.open("r", encoding="utf-8", newline="") as handle:
-        first_line = handle.readline()
+    try:
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            first_line = handle.readline()
+    except (OSError, UnicodeDecodeError):
+        return None
 
     if not first_line:
         return None
 
-    item = json.loads(first_line.rstrip("\r\n"))
+    try:
+        item = json.loads(first_line.rstrip("\r\n"))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(item, dict):
+        return None
     if item.get("type") != "session_meta":
         return None
 
@@ -331,27 +437,32 @@ def scan_session_records(paths: Paths) -> list[SessionRecord]:
     return records
 
 
-def read_session_index(paths: Paths) -> OrderedDict[str, dict[str, str]]:
-    entries: OrderedDict[str, dict[str, str]] = OrderedDict()
+def read_session_index(paths: Paths) -> OrderedDict[str, dict[str, Any]]:
+    entries: OrderedDict[str, dict[str, Any]] = OrderedDict()
     if not paths.session_index_path.exists():
         return entries
 
     for line in read_text(paths.session_index_path).splitlines():
         if not line.strip():
             continue
-        entry = json.loads(line)
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
         thread_id = str(entry.get("id") or "").strip()
         if not thread_id:
             continue
-        entries[thread_id] = {
-            "id": thread_id,
-            "thread_name": str(entry.get("thread_name") or thread_id),
-            "updated_at": str(entry.get("updated_at") or ""),
-        }
+        normalized = dict(entry)
+        normalized["id"] = thread_id
+        normalized["thread_name"] = str(normalized.get("thread_name") or thread_id)
+        normalized["updated_at"] = str(normalized.get("updated_at") or "")
+        entries[thread_id] = normalized
     return entries
 
 
-def write_session_index(paths: Paths, entries: list[dict[str, str]]) -> None:
+def write_session_index(paths: Paths, entries: list[dict[str, Any]]) -> None:
     lines = [json.dumps(entry, ensure_ascii=False, separators=(",", ":")) for entry in entries]
     content = "\n".join(lines)
     if content:
@@ -363,14 +474,21 @@ def iso_utc_from_unix(timestamp: int) -> str:
     return datetime.fromtimestamp(timestamp, tz=UTC).isoformat().replace("+00:00", "Z")
 
 
+def iso_utc_from_unix_ms(timestamp_ms: int) -> str:
+    return datetime.fromtimestamp(timestamp_ms / 1000, tz=UTC).isoformat().replace("+00:00", "Z")
+
+
 def parse_index_timestamp(value: str) -> datetime:
     if not value:
         return datetime.fromtimestamp(0, tz=UTC)
-    normalized = value.replace("Z", "+00:00")
-    parsed = datetime.fromisoformat(normalized)
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC)
+    try:
+        normalized = str(value).replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+    except ValueError:
+        return datetime.fromtimestamp(0, tz=UTC)
 
 
 def snapshot_metadata(paths: Paths, backup_path: Path) -> None:
@@ -379,8 +497,11 @@ def snapshot_metadata(paths: Paths, backup_path: Path) -> None:
 
     items: list[dict[str, str]] = []
     for path in iter_session_paths(paths):
-        with path.open("r", encoding="utf-8", newline="") as handle:
-            first_line = handle.readline().rstrip("\r\n")
+        try:
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                first_line = handle.readline().rstrip("\r\n")
+        except FileNotFoundError:
+            continue
         if not first_line:
             continue
 
@@ -397,10 +518,19 @@ def snapshot_metadata(paths: Paths, backup_path: Path) -> None:
     )
 
 
-def restore_metadata(paths: Paths, backup_path: Path) -> dict[str, object]:
+def restore_metadata(
+    paths: Paths,
+    backup_path: Path,
+    progress: ProgressCallback | None = None,
+) -> dict[str, object]:
     started_at = time.monotonic()
     session_index_restored = False
     session_files_restored = 0
+    session_files_missing = 0
+    session_files_skipped = 0
+    unsafe_paths_skipped = 0
+    metadata_error = ""
+    emit_progress(progress, "progress", "metadata", "正在恢复侧边栏索引和会话元数据...", started_at=started_at)
 
     index_backup = session_index_backup_path(backup_path)
     if index_backup.exists():
@@ -409,29 +539,132 @@ def restore_metadata(paths: Paths, backup_path: Path) -> dict[str, object]:
 
     meta_backup = session_meta_backup_path(backup_path)
     if meta_backup.exists():
-        for item in json.loads(read_text(meta_backup)):
-            raw_path = Path(item["path"])
-            path = raw_path if raw_path.is_absolute() else paths.codex_home / raw_path
+        try:
+            metadata_items = json.loads(read_text(meta_backup))
+        except json.JSONDecodeError as exc:
+            metadata_items = []
+            metadata_error = f"Could not parse session metadata backup: {exc}"
+
+        if not isinstance(metadata_items, list):
+            metadata_items = []
+            metadata_error = "Session metadata backup is not a JSON array."
+
+        total_items = len(metadata_items)
+        emit_progress(
+            progress,
+            "progress",
+            "metadata",
+            "正在恢复会话文件首行元数据...",
+            started_at=started_at,
+            done=0,
+            total=total_items,
+            extra={"restored": 0, "skipped": 0, "missing": 0},
+        )
+
+        def emit_metadata_progress(processed: int) -> None:
+            if not should_emit_count_progress(processed, total_items):
+                return
+            emit_progress(
+                progress,
+                "progress",
+                "metadata",
+                "正在恢复会话文件首行元数据...",
+                started_at=started_at,
+                done=processed,
+                total=total_items,
+                extra={
+                    "restored": session_files_restored,
+                    "skipped": session_files_skipped + unsafe_paths_skipped,
+                    "missing": session_files_missing,
+                },
+            )
+
+        for processed, item in enumerate(metadata_items, start=1):
+            if not isinstance(item, dict) or not isinstance(item.get("first_line"), str):
+                session_files_skipped += 1
+                emit_metadata_progress(processed)
+                continue
+            if "\n" in item["first_line"] or "\r" in item["first_line"]:
+                session_files_skipped += 1
+                emit_metadata_progress(processed)
+                continue
+            path = safe_session_metadata_path(paths, str(item.get("path") or ""))
+            if path is None:
+                unsafe_paths_skipped += 1
+                emit_metadata_progress(processed)
+                continue
             if not path.exists():
+                session_files_missing += 1
+                emit_metadata_progress(processed)
                 continue
             # 只恢复首行 session_meta，后面的对话内容保持原文件不动。
             replace_first_line(path, str(item["first_line"]))
             session_files_restored += 1
+            emit_metadata_progress(processed)
+
+    emit_progress(
+        progress,
+        "progress",
+        "metadata",
+        "侧边栏索引和会话元数据已恢复。",
+        started_at=started_at,
+        extra={
+            "restored": session_files_restored,
+            "skipped": session_files_skipped + unsafe_paths_skipped,
+            "missing": session_files_missing,
+        },
+    )
 
     return {
         "session_index_restored": session_index_restored,
         "session_files_restored": session_files_restored,
+        "session_files_missing": session_files_missing,
+        "session_files_skipped": session_files_skipped,
+        "unsafe_paths_skipped": unsafe_paths_skipped,
+        "metadata_error": metadata_error,
         "duration_ms": elapsed_ms(started_at),
     }
 
 
-def rebuild_session_index(paths: Paths, conn: sqlite3.Connection) -> dict[str, int]:
+def path_is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def safe_session_metadata_path(paths: Paths, raw_path: str) -> Path | None:
+    if not raw_path:
+        return None
+    candidate = Path(raw_path).expanduser()
+    if not candidate.is_absolute():
+        candidate = paths.codex_home / candidate
+
+    if not SESSION_FILENAME_PATTERN.search(candidate.name):
+        return None
+
+    sessions_dir = paths.sessions_dir.resolve(strict=False)
+    resolved = candidate.resolve(strict=False)
+    if not path_is_relative_to(resolved, sessions_dir):
+        return None
+    return resolved
+
+
+def rebuild_session_index(
+    paths: Paths,
+    conn: sqlite3.Connection,
+    progress: ProgressCallback | None = None,
+) -> dict[str, int]:
     started_at = time.monotonic()
+    emit_progress(progress, "progress", "index", "正在读取侧边栏索引...", started_at=started_at)
     existing_entries = read_session_index(paths)
-    columns = get_thread_columns(conn)
+    columns = ensure_thread_schema(conn)
     select_parts = ["id"]
     if "title" in columns:
         select_parts.append("title")
+    if "updated_at_ms" in columns:
+        select_parts.append("updated_at_ms")
     if "updated_at" in columns:
         select_parts.append("updated_at")
     where_sql = "WHERE archived = 0" if "archived" in columns else ""
@@ -443,53 +676,128 @@ def rebuild_session_index(paths: Paths, conn: sqlite3.Connection) -> dict[str, i
         ORDER BY id ASC
         """
     ).fetchall()
-    db_ids = {str(row["id"]) for row in db_rows}
+    emit_progress(
+        progress,
+        "progress",
+        "index",
+        "正在重建侧边栏索引...",
+        started_at=started_at,
+        done=0,
+        total=len(db_rows),
+        extra={"existing_entries": len(existing_entries)},
+    )
+    visible_db_ids = {str(row["id"]) for row in db_rows}
+    all_db_ids = {str(row["id"]) for row in conn.execute("SELECT id FROM threads")}
     existing_ids = set(existing_entries)
 
-    merged: list[dict[str, str]] = []
+    merged: list[dict[str, Any]] = []
     for row in db_rows:
         thread_id = str(row["id"])
         existing_entry = existing_entries.get(thread_id)
         title = str(row["title"]) if "title" in columns and row["title"] else thread_id
-        updated_at = int(row["updated_at"]) if "updated_at" in columns and row["updated_at"] else 0
-        merged.append(
-            {
-                "id": thread_id,
-                "thread_name": str((existing_entry or {}).get("thread_name") or title),
-                "updated_at": iso_utc_from_unix(updated_at),
-            }
-        )
+        if "updated_at_ms" in columns and row["updated_at_ms"]:
+            updated_at = iso_utc_from_unix_ms(int(row["updated_at_ms"]))
+        elif "updated_at" in columns and row["updated_at"]:
+            updated_at = iso_utc_from_unix(int(row["updated_at"]))
+        else:
+            updated_at = iso_utc_from_unix(0)
+
+        entry = dict(existing_entry or {})
+        entry["id"] = thread_id
+        entry["thread_name"] = str(entry.get("thread_name") or title)
+        entry["updated_at"] = updated_at
+        merged.append(entry)
 
     for thread_id, entry in existing_entries.items():
-        if thread_id not in db_ids:
+        if thread_id not in all_db_ids:
             merged.append(entry)
 
     merged.sort(key=lambda item: (parse_index_timestamp(item["updated_at"]), item["id"]))
     write_session_index(paths, merged)
+    emit_progress(
+        progress,
+        "progress",
+        "index",
+        "侧边栏索引已重建。",
+        started_at=started_at,
+        done=len(db_rows),
+        total=len(db_rows),
+        extra={"rewritten_entries": len(merged)},
+    )
 
     return {
         "rewritten_index_entries": len(merged),
-        "missing_session_index_entries_before": len(db_ids - existing_ids),
-        "preserved_index_only_entries": len(existing_ids - db_ids),
+        "missing_session_index_entries_before": len(visible_db_ids - existing_ids),
+        "preserved_index_only_entries": len(existing_ids - all_db_ids),
+        "removed_archived_index_entries": len((existing_ids & all_db_ids) - visible_db_ids),
         "duration_ms": elapsed_ms(started_at),
     }
 
 
-def sync_session_records(paths: Paths, current_provider: str, current_model: str | None) -> dict[str, object]:
+def sync_session_records(
+    paths: Paths,
+    current_provider: str,
+    current_model: str | None,
+    progress: ProgressCallback | None = None,
+) -> dict[str, object]:
     started_at = time.monotonic()
+    emit_progress(progress, "progress", "sessions", "正在扫描会话文件...", started_at=started_at)
     before_records = scan_session_records(paths)
     updated_session_files = 0
+    skipped_session_files = 0
+    total_records = len(before_records)
+    emit_progress(
+        progress,
+        "progress",
+        "sessions",
+        "正在同步会话文件元数据...",
+        started_at=started_at,
+        done=0,
+        total=total_records,
+        extra={"updated": 0, "skipped": 0},
+    )
 
-    for record in before_records:
+    def emit_session_progress(processed: int) -> None:
+        if not should_emit_count_progress(processed, total_records):
+            return
+        emit_progress(
+            progress,
+            "progress",
+            "sessions",
+            "正在同步会话文件元数据...",
+            started_at=started_at,
+            done=processed,
+            total=total_records,
+            extra={"updated": updated_session_files, "skipped": skipped_session_files},
+        )
+
+    for processed, record in enumerate(before_records, start=1):
         model_matches = current_model is None or record.model == current_model
         if record.model_provider == current_provider and model_matches:
+            emit_session_progress(processed)
             continue
 
-        text = read_text_exact(record.path)
+        try:
+            text = read_text_exact(record.path)
+        except (OSError, UnicodeDecodeError):
+            skipped_session_files += 1
+            emit_session_progress(processed)
+            continue
         first_line, ending, remainder = split_first_line(text)
-        item = json.loads(first_line)
+        try:
+            item = json.loads(first_line)
+        except json.JSONDecodeError:
+            skipped_session_files += 1
+            emit_session_progress(processed)
+            continue
+        if not isinstance(item, dict):
+            skipped_session_files += 1
+            emit_session_progress(processed)
+            continue
         payload = item.get("payload")
         if not isinstance(payload, dict):
+            skipped_session_files += 1
+            emit_session_progress(processed)
             continue
 
         payload["model_provider"] = current_provider
@@ -502,10 +810,22 @@ def sync_session_records(paths: Paths, current_provider: str, current_model: str
             new_text = new_first_line
         write_text_exact(record.path, new_text)
         updated_session_files += 1
+        emit_session_progress(processed)
 
     after_records = scan_session_records(paths)
+    emit_progress(
+        progress,
+        "progress",
+        "sessions",
+        "会话文件元数据已同步。",
+        started_at=started_at,
+        done=total_records,
+        total=total_records,
+        extra={"updated": updated_session_files, "skipped": skipped_session_files},
+    )
     return {
         "updated_session_files": updated_session_files,
+        "skipped_session_files": skipped_session_files,
         "session_before_counts": counts_to_rows(
             ordered_counts([record.model_provider for record in before_records])
         ),
@@ -541,9 +861,20 @@ def update_provider_assignments(
     paths: Paths,
     current_provider: str,
     current_model: str | None,
+    progress: ProgressCallback | None = None,
 ) -> dict[str, object]:
     started_at = time.monotonic()
     last_error: sqlite3.OperationalError | None = None
+    emit_progress(
+        progress,
+        "progress",
+        "database",
+        "正在等待数据库空闲并更新历史归属...",
+        started_at=started_at,
+        done=0,
+        total=WRITE_LOCK_RETRY_LIMIT,
+        extra={"attempt": 0},
+    )
 
     for attempt in range(1, WRITE_LOCK_RETRY_LIMIT + 1):
         try:
@@ -554,7 +885,7 @@ def update_provider_assignments(
             ) as conn:
                 # 显式拿写锁，把等待控制在我们自己的重试节奏里。
                 conn.execute("BEGIN IMMEDIATE")
-                columns = get_thread_columns(conn)
+                columns = ensure_thread_schema(conn)
                 before_counts = query_provider_counts(conn)
                 before_model_counts = query_model_counts(conn) if "model" in columns else OrderedDict()
                 set_parts = ["model_provider = ?"]
@@ -581,6 +912,16 @@ def update_provider_assignments(
                 after_model_counts = query_model_counts(conn) if "model" in columns else OrderedDict()
                 checkpoint_result = checkpoint(conn)
 
+            emit_progress(
+                progress,
+                "progress",
+                "database",
+                "数据库历史归属已更新。",
+                started_at=started_at,
+                done=attempt,
+                total=WRITE_LOCK_RETRY_LIMIT,
+                extra={"updated_rows": updated_rows, "attempt": attempt},
+            )
             return {
                 "attempts": attempt,
                 "lock_wait_ms": elapsed_ms(started_at),
@@ -601,6 +942,16 @@ def update_provider_assignments(
             if not is_locked_error(exc):
                 raise
             last_error = exc
+            emit_progress(
+                progress,
+                "progress",
+                "database",
+                "数据库正在忙，继续等待空闲...",
+                started_at=started_at,
+                done=attempt,
+                total=WRITE_LOCK_RETRY_LIMIT,
+                extra={"attempt": attempt, "action": "waiting_for_lock"},
+            )
             if attempt >= WRITE_LOCK_RETRY_LIMIT:
                 waited_seconds = (time.monotonic() - started_at)
                 raise RuntimeError(
@@ -613,9 +964,23 @@ def update_provider_assignments(
     raise RuntimeError("Database write lock retry loop ended unexpectedly.") from last_error
 
 
-def restore_database_with_retry(paths: Paths, chosen_backup: Path) -> dict[str, object]:
+def restore_database_with_retry(
+    paths: Paths,
+    chosen_backup: Path,
+    progress: ProgressCallback | None = None,
+) -> dict[str, object]:
     started_at = time.monotonic()
     last_error: sqlite3.OperationalError | None = None
+    emit_progress(
+        progress,
+        "progress",
+        "database",
+        "正在等待数据库空闲并恢复备份...",
+        started_at=started_at,
+        done=0,
+        total=WRITE_LOCK_RETRY_LIMIT,
+        extra={"attempt": 0},
+    )
 
     for attempt in range(1, WRITE_LOCK_RETRY_LIMIT + 1):
         try:
@@ -629,6 +994,16 @@ def restore_database_with_retry(paths: Paths, chosen_backup: Path) -> dict[str, 
                 source.backup(target)
                 checkpoint_result = checkpoint(target)
 
+            emit_progress(
+                progress,
+                "progress",
+                "database",
+                "数据库备份已恢复。",
+                started_at=started_at,
+                done=attempt,
+                total=WRITE_LOCK_RETRY_LIMIT,
+                extra={"attempt": attempt},
+            )
             return {
                 "attempts": attempt,
                 "lock_wait_ms": elapsed_ms(started_at),
@@ -643,6 +1018,16 @@ def restore_database_with_retry(paths: Paths, chosen_backup: Path) -> dict[str, 
             if not is_locked_error(exc):
                 raise
             last_error = exc
+            emit_progress(
+                progress,
+                "progress",
+                "database",
+                "数据库正在忙，继续等待恢复...",
+                started_at=started_at,
+                done=attempt,
+                total=WRITE_LOCK_RETRY_LIMIT,
+                extra={"attempt": attempt, "action": "waiting_for_lock"},
+            )
             if attempt >= WRITE_LOCK_RETRY_LIMIT:
                 waited_seconds = (time.monotonic() - started_at)
                 raise RuntimeError(
@@ -673,7 +1058,7 @@ def get_status(paths: Paths) -> dict[str, object]:
     index_entries = read_session_index(paths)
 
     with connect_db(paths.db_path, readonly=True) as conn:
-        columns = get_thread_columns(conn)
+        columns = ensure_thread_schema(conn)
         counts = query_provider_counts(conn)
         model_counts = query_model_counts(conn) if "model" in columns else OrderedDict()
         provider_model_counts = query_provider_model_counts(conn) if "model" in columns else []
@@ -721,36 +1106,81 @@ def get_status(paths: Paths) -> dict[str, object]:
     }
 
 
-def make_backup(paths: Paths, label: str) -> Path:
+def make_backup(
+    paths: Paths,
+    label: str,
+    progress: ProgressCallback | None = None,
+) -> Path:
+    started_at = time.monotonic()
+    emit_progress(progress, "progress", "backup", "正在检查备份环境...", started_at=started_at)
     ensure_environment(paths)
     paths.backup_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    backup_path = paths.backup_dir / f"state_5.sqlite.{label}.{timestamp}.bak"
+    backup_path = unique_backup_path(paths, label)
+    emit_progress(progress, "progress", "backup", "正在复制数据库备份...", started_at=started_at)
+
+    def report_backup_progress(status: int, remaining: int, total: int) -> None:
+        if total <= 0:
+            return
+        done = max(0, total - remaining)
+        if not should_emit_count_progress(done, total):
+            return
+        emit_progress(
+            progress,
+            "progress",
+            "backup",
+            "正在复制数据库备份...",
+            started_at=started_at,
+            done=done,
+            total=total,
+            extra={"sqlite_status": status},
+        )
+
     with connect_db(paths.db_path, readonly=True) as source, connect_db(backup_path, readonly=False) as target:
-        source.backup(target)
+        source.backup(target, pages=128, progress=report_backup_progress)
+    emit_progress(progress, "progress", "backup", "正在保存侧边栏索引和会话元数据...", started_at=started_at)
     snapshot_metadata(paths, backup_path)
     backup_path.touch()
+    emit_progress(progress, "progress", "backup", "备份已创建。", started_at=started_at, extra={"label": label})
     return backup_path
 
 
-def sync_to_current_provider(paths: Paths) -> dict[str, object]:
+def sync_to_current_provider(
+    paths: Paths,
+    progress: ProgressCallback | None = None,
+) -> dict[str, object]:
     total_started_at = time.monotonic()
+    emit_progress(progress, "progress", "scan", "正在扫描当前 Codex 历史状态...", started_at=total_started_at)
     status_before = get_status(paths)
+    emit_progress(
+        progress,
+        "progress",
+        "scan",
+        "当前状态扫描完成。",
+        started_at=total_started_at,
+        done=status_before["total_threads"],
+        total=status_before["total_threads"],
+        extra={
+            "movable_threads": status_before["movable_threads"],
+            "session_file_count": status_before["session_file_count"],
+        },
+    )
     current_provider = str(status_before["current_provider"])
     raw_current_model = status_before.get("current_model")
     current_model = str(raw_current_model) if raw_current_model else None
 
     backup_started_at = time.monotonic()
-    backup_path = make_backup(paths, "pre-sync")
+    backup_path = make_backup(paths, "pre-sync", progress)
     backup_duration_ms = elapsed_ms(backup_started_at)
 
-    db_summary = update_provider_assignments(paths, current_provider, current_model)
-    session_summary = sync_session_records(paths, current_provider, current_model)
+    db_summary = update_provider_assignments(paths, current_provider, current_model, progress)
+    session_summary = sync_session_records(paths, current_provider, current_model, progress)
 
     with connect_db(paths.db_path, readonly=True) as conn:
-        index_summary = rebuild_session_index(paths, conn)
+        index_summary = rebuild_session_index(paths, conn, progress)
 
+    emit_progress(progress, "progress", "status", "正在刷新同步后的状态...", started_at=total_started_at)
     status_after = get_status(paths)
+    emit_progress(progress, "progress", "status", "同步后的状态已刷新。", started_at=total_started_at)
     return {
         "action": "sync",
         "current_provider": current_provider,
@@ -758,6 +1188,7 @@ def sync_to_current_provider(paths: Paths) -> dict[str, object]:
         "synced_fields": db_summary["synced_fields"],
         "updated_rows": db_summary["updated_rows"],
         "updated_session_files": session_summary["updated_session_files"],
+        "skipped_session_files": session_summary["skipped_session_files"],
         "provider_movable_threads": status_before["provider_movable_threads"],
         "model_movable_threads": status_before["model_movable_threads"],
         "backup_path": str(backup_path),
@@ -799,25 +1230,45 @@ def resolve_backup(paths: Paths, requested_path: str | None) -> Path:
     return backup
 
 
-def restore_backup(paths: Paths, backup_path: str | None) -> dict[str, object]:
+def create_manual_backup(
+    paths: Paths,
+    progress: ProgressCallback | None = None,
+) -> dict[str, object]:
     total_started_at = time.monotonic()
+    backup_path = make_backup(paths, "manual", progress)
+    return {
+        "action": "backup",
+        "backup_path": str(backup_path),
+        "timing": {"total_ms": elapsed_ms(total_started_at)},
+    }
+
+
+def restore_backup(
+    paths: Paths,
+    backup_path: str | None,
+    progress: ProgressCallback | None = None,
+) -> dict[str, object]:
+    total_started_at = time.monotonic()
+    emit_progress(progress, "progress", "restore", "正在检查恢复环境...", started_at=total_started_at)
     ensure_environment(paths)
     chosen_backup = resolve_backup(paths, backup_path)
 
     backup_started_at = time.monotonic()
-    restore_snapshot = make_backup(paths, "pre-restore")
+    restore_snapshot = make_backup(paths, "pre-restore", progress)
     backup_duration_ms = elapsed_ms(backup_started_at)
 
     restore_db_started_at = time.monotonic()
-    restore_db_summary = restore_database_with_retry(paths, chosen_backup)
+    restore_db_summary = restore_database_with_retry(paths, chosen_backup, progress)
     restore_db_duration_ms = elapsed_ms(restore_db_started_at)
 
-    restore_summary = restore_metadata(paths, chosen_backup)
+    restore_summary = restore_metadata(paths, chosen_backup, progress)
     # 恢复后统一重建索引，让数据库与侧边栏索引重新对齐。
     with connect_db(paths.db_path, readonly=True) as conn:
-        index_summary = rebuild_session_index(paths, conn)
+        index_summary = rebuild_session_index(paths, conn, progress)
 
+    emit_progress(progress, "progress", "status", "正在刷新恢复后的状态...", started_at=total_started_at)
     status_after = get_status(paths)
+    emit_progress(progress, "progress", "status", "恢复后的状态已刷新。", started_at=total_started_at)
     return {
         "action": "restore",
         "restored_from": str(chosen_backup),
@@ -842,10 +1293,28 @@ def to_json(payload: dict[str, object]) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
+def to_jsonl(payload: dict[str, object]) -> str:
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def run_command(args: argparse.Namespace, paths: Paths, progress: ProgressCallback | None = None) -> dict[str, object]:
+    if args.command == "status":
+        return get_status(paths)
+    if args.command == "sync":
+        return sync_to_current_provider(paths, progress)
+    if args.command == "restore":
+        return restore_backup(paths, args.backup, progress)
+    if args.command == "backup":
+        return create_manual_backup(paths, progress)
+    raise RuntimeError(f"Unsupported command: {args.command}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Codex history sync helper")
     parser.add_argument("--codex-home", help="Override Codex home directory")
-    parser.add_argument("--json", action="store_true", help="Emit JSON output")
+    output_group = parser.add_mutually_exclusive_group()
+    output_group.add_argument("--json", action="store_true", help="Emit JSON output")
+    output_group.add_argument("--jsonl", action="store_true", help="Emit newline-delimited progress JSON")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("status", help="Show current provider/thread status")
@@ -857,26 +1326,25 @@ def main() -> int:
     args = parser.parse_args()
     paths = resolve_paths(args.codex_home)
 
+    def emit_jsonl(payload: dict[str, object]) -> None:
+        print(to_jsonl(payload), flush=True)
+
+    progress = emit_jsonl if args.jsonl else None
+
     try:
-        if args.command == "status":
-            payload = get_status(paths)
-        elif args.command == "sync":
-            payload = sync_to_current_provider(paths)
-        elif args.command == "restore":
-            payload = restore_backup(paths, args.backup)
-        elif args.command == "backup":
-            ensure_environment(paths)
-            backup_started_at = time.monotonic()
-            payload = {
-                "action": "backup",
-                "backup_path": str(make_backup(paths, "manual")),
-                "timing": {"total_ms": elapsed_ms(backup_started_at)},
-            }
-        else:
-            raise RuntimeError(f"Unsupported command: {args.command}")
+        payload = run_command(args, paths, progress)
     except Exception as exc:
         error_payload = {"ok": False, "error": str(exc)}
-        if args.json:
+        if args.jsonl:
+            emit_jsonl(
+                build_progress_event(
+                    "error",
+                    args.command or "unknown",
+                    str(exc),
+                    extra={"error": str(exc)},
+                )
+            )
+        elif args.json:
             print(to_json(error_payload))
         else:
             print(error_payload["error"])
@@ -885,7 +1353,18 @@ def main() -> int:
     if isinstance(payload, dict):
         payload["ok"] = True
 
-    if args.json:
+    if args.jsonl:
+        emit_jsonl(
+            build_progress_event(
+                "result",
+                args.command,
+                "操作完成。",
+                done=1,
+                total=1,
+                extra=payload,
+            )
+        )
+    elif args.json:
         print(to_json(payload))
     else:
         print(payload)

@@ -62,6 +62,14 @@ python3 sync_backend.py --json status
 python3 sync_backend.py --json sync
 ```
 
+如果想在命令行里实时看到阶段进度，可以使用 JSONL 事件流：
+
+```bash
+python3 sync_backend.py --jsonl sync
+```
+
+`backup` 和 `restore` 也支持同样的 `--jsonl` 进度事件流。
+
 ### 手动创建备份
 
 ```bash
