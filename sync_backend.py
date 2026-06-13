@@ -115,10 +115,8 @@ def parse_toml_string_value(config_text: str, key: str) -> str | None:
     return match.group(2) if match else None
 
 
-def parse_current_provider(config_text: str) -> str:
+def parse_current_provider(config_text: str) -> str | None:
     value = parse_toml_string_value(config_text, "model_provider")
-    if value is None:
-        raise RuntimeError("Could not find model_provider in config.toml.")
     return value
 
 
@@ -325,6 +323,39 @@ def query_cwd_counts(conn: sqlite3.Connection, limit: int = 20) -> list[dict[str
     ):
         rows.append({"cwd": str(cwd or "(empty)"), "count": int(count)})
     return rows
+
+
+def infer_current_provider(conn: sqlite3.Connection) -> str:
+    row = conn.execute(
+        """
+        SELECT model_provider
+        FROM threads
+        WHERE archived = 0
+          AND model_provider IS NOT NULL
+          AND model_provider <> ''
+        ORDER BY COALESCE(updated_at_ms, updated_at * 1000, 0) DESC, id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    if row and row["model_provider"]:
+        return str(row["model_provider"])
+
+    row = conn.execute(
+        """
+        SELECT model_provider
+        FROM threads
+        WHERE model_provider IS NOT NULL
+          AND model_provider <> ''
+        ORDER BY COALESCE(updated_at_ms, updated_at * 1000, 0) DESC, id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    if row and row["model_provider"]:
+        return str(row["model_provider"])
+
+    raise RuntimeError(
+        "Could not determine current model_provider from config.toml or local history database."
+    )
 
 
 def count_mismatched(conn: sqlite3.Connection, column: str, expected: str | None) -> int | None:
@@ -1043,22 +1074,17 @@ def restore_database_with_retry(
 def get_status(paths: Paths) -> dict[str, object]:
     ensure_environment(paths)
     config_text = read_text(paths.config_path)
-    current_provider = parse_current_provider(config_text)
+    configured_provider = parse_current_provider(config_text)
     current_model = parse_current_model(config_text)
     session_records = scan_session_records(paths)
     session_provider_counts = ordered_counts([record.model_provider for record in session_records])
     session_model_counts = ordered_counts([record.model or "(empty)" for record in session_records])
-    session_movable_ids = {
-        record.thread_id
-        for record in session_records
-        if record.model_provider != current_provider
-        or (current_model is not None and record.model != current_model)
-    }
     should_check_index = paths.session_index_path.exists() or paths.sessions_dir.exists()
     index_entries = read_session_index(paths)
 
     with connect_db(paths.db_path, readonly=True) as conn:
         columns = ensure_thread_schema(conn)
+        current_provider = configured_provider or infer_current_provider(conn)
         counts = query_provider_counts(conn)
         model_counts = query_model_counts(conn) if "model" in columns else OrderedDict()
         provider_model_counts = query_provider_model_counts(conn) if "model" in columns else []
@@ -1076,7 +1102,13 @@ def get_status(paths: Paths) -> dict[str, object]:
         db_thread_query = "SELECT id FROM threads WHERE archived = 0" if "archived" in columns else "SELECT id FROM threads"
         db_thread_ids = {str(row["id"]) for row in conn.execute(db_thread_query)}
         missing_index_ids = db_thread_ids - set(index_entries) if should_check_index else set()
-        sync_candidate_ids = db_movable_ids | session_movable_ids | missing_index_ids
+    session_movable_ids = {
+        record.thread_id
+        for record in session_records
+        if record.model_provider != current_provider
+        or (current_model is not None and record.model != current_model)
+    }
+    sync_candidate_ids = db_movable_ids | session_movable_ids | missing_index_ids
 
     return {
         "codex_home": str(paths.codex_home),
